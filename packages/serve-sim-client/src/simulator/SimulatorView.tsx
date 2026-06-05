@@ -775,7 +775,7 @@ export function SimulatorView({
             style={relayMode ? { display: "none" } : streamImageStyle}
           />
         )}
-        {relayMode && (
+        {relayMode && !useAvcc && (
           <img
             ref={relayImgRef}
             draggable={false}
