@@ -13,6 +13,8 @@ import { findBootedDevice, resolveDevice } from "./device";
 import { permissions } from "./permissions";
 import { uiSettings } from "./ui-settings";
 import { debugCli, debugHelper, debugState } from "./debug";
+import type { EventLogEntry } from "./event-log";
+import { formatEventLogLine } from "./event-log-format";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
@@ -203,6 +205,11 @@ function pickDefaultDevice(): { udid: string; name: string } | null {
 }
 
 function getDeviceName(udid: string): string | null {
+  return readDeviceNamesByUdid().get(udid) ?? null;
+}
+
+function readDeviceNamesByUdid(): Map<string, string> {
+  const names = new Map<string, string>();
   try {
     const output = execSync("xcrun simctl list devices -j", { encoding: "utf-8" });
     const data = JSON.parse(output) as {
@@ -210,11 +217,11 @@ function getDeviceName(udid: string): string | null {
     };
     for (const runtime of Object.values(data.devices)) {
       for (const device of runtime) {
-        if (device.udid === udid) return device.name;
+        names.set(device.udid, device.name);
       }
     }
   } catch {}
-  return null;
+  return names;
 }
 
 function isDeviceBooted(udid: string): boolean {
@@ -621,6 +628,78 @@ function killStreams(deviceArg?: string) {
     clearState();
     console.log(JSON.stringify({ disconnected: true, devices }));
   }
+}
+
+async function eventLog(
+  deviceArg?: string,
+  opts: { json?: boolean; limit?: string } = {},
+) {
+  const udid = deviceArg ? resolveDevice(deviceArg) : undefined;
+  const state = readState(udid);
+  if (!state) {
+    console.error("No serve-sim server running. Run `serve-sim` first.");
+    process.exit(1);
+  }
+
+  const url = new URL("/api/event-log", state.url);
+  if (udid) url.searchParams.set("device", state.device);
+  const limit = parseEventLogLimit(opts.limit);
+  if (limit != null) url.searchParams.set("limit", String(limit));
+
+  let payload: { events: EventLogEntry[] };
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    payload = await res.json() as { events: EventLogEntry[] };
+  } catch (err) {
+    console.error(`Failed to read event log: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+  if (payload.events.length === 0) {
+    console.log("No events.");
+    return;
+  }
+  const deviceLabels = deviceLabelsForEvents(payload.events);
+  for (const entry of payload.events) {
+    console.log(formatEventLogLine(entry, {
+      deviceLabel: entry.device ? deviceLabels.get(entry.device) : null,
+    }));
+  }
+}
+
+function parseEventLogLimit(value: string | undefined): number | undefined {
+  if (value == null) return undefined;
+  const limit = Number(value);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    console.error("event-log --limit must be a positive number");
+    process.exit(1);
+  }
+  return Math.floor(limit);
+}
+
+function deviceLabelsForEvents(events: EventLogEntry[]): Map<string, string> {
+  const devices = [...new Set(events.map((event) => event.device).filter((device): device is string => !!device))];
+  const names = new Map<string, string>();
+  const deviceNames = readDeviceNamesByUdid();
+  for (const device of devices) {
+    names.set(device, deviceNames.get(device) ?? device.slice(0, 8));
+  }
+
+  const counts = new Map<string, number>();
+  for (const name of names.values()) {
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+
+  const labels = new Map<string, string>();
+  for (const [device, name] of names) {
+    labels.set(device, counts.get(name)! > 1 ? `${name} (${device.slice(0, 8)})` : name);
+  }
+  return labels;
 }
 
 async function gesture(jsonStr: string, deviceArg?: string) {
@@ -1802,6 +1881,14 @@ program
   .description("Simulate a memory warning on the device")
   .option(...deviceOpt)
   .action((opts) => memoryWarning(opts.device));
+
+program
+  .command("event-log")
+  .description("Show recent simulator events")
+  .option(...deviceOpt)
+  .option("-j, --json", "Print JSON")
+  .option("-n, --limit <count>", "Maximum number of events")
+  .action((opts) => eventLog(opts.device, { json: opts.json, limit: opts.limit }));
 
 // `camera` and `permissions` keep their own dedicated argument parsers (the
 // camera verb has nested sub-verbs and source flags; permissions has a

@@ -23,6 +23,7 @@ import {
   axFrontmostAsync,
   type MjpegFrame,
 } from "./native";
+import { eventLogEventForHidMessage, formatEventLogPoint, recordEventLogEvent, updateEventLogEvent } from "./event-log";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -51,6 +52,38 @@ const AVCC_SEED_TAG = 0x04;
 const WS_MSG_CONFIG = 0x82;
 
 const MJPEG_TRAILER = Buffer.from("\r\n", "ascii");
+const TOUCH_TAP_MAX_DISTANCE = 0.004;
+
+type TouchGestureLog = {
+  eventId?: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  moveCount: number;
+  edge?: number;
+};
+
+function touchGestureSummary(gesture: TouchGestureLog): string {
+  return `Drag ${formatEventLogPoint(gesture.startX, gesture.startY)} -> ${formatEventLogPoint(gesture.lastX, gesture.lastY)}`;
+}
+
+function touchGestureMoved(gesture: TouchGestureLog): boolean {
+  const dx = gesture.lastX - gesture.startX;
+  const dy = gesture.lastY - gesture.startY;
+  return Math.hypot(dx, dy) > TOUCH_TAP_MAX_DISTANCE;
+}
+
+function newTouchGesture(payload: { x: number; y: number; edge?: number }): TouchGestureLog {
+  return {
+    startX: payload.x,
+    startY: payload.y,
+    lastX: payload.x,
+    lastY: payload.y,
+    moveCount: 0,
+    edge: payload.edge,
+  };
+}
 
 function mjpegHeader(jpegLength: number): Buffer {
   return Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegLength}\r\n\r\n`, "ascii");
@@ -103,6 +136,7 @@ export class DeviceSession {
   private latestJpegBuffer: Buffer | null = null;
   private latestJpegLength = 0;
   private readonly hidSockets = new Set<HidSocket>();
+  private touchGestureLog?: TouchGestureLog;
 
   constructor(public readonly udid: string) {
     this.hid = new NativeHid(udid);
@@ -272,12 +306,16 @@ export class DeviceSession {
     switch (tag) {
       case 0x03: {
         const m = json<{ type: string; x: number; y: number; edge?: number }>();
-        if (m) this.hid.touch(m.type as "begin" | "move" | "end", m.x, m.y, W, H, m.edge ?? 0);
+        if (m) {
+          this.recordTouchEvent(m);
+          this.hid.touch(m.type as "begin" | "move" | "end", m.x, m.y, W, H, m.edge ?? 0);
+        }
         break;
       }
       case 0x04: {
         const m = json<{ button: string; page?: number; usage?: number; phase?: string }>();
         if (!m) break;
+        this.recordHidEvent(tag, m);
         if (m.page != null && m.usage != null) {
           this.hid.buttonHid(m.page, m.usage, (m.phase as "down" | "up" | "press") ?? "press");
         } else {
@@ -287,12 +325,18 @@ export class DeviceSession {
       }
       case 0x05: {
         const m = json<{ type: string; x1: number; y1: number; x2: number; y2: number }>();
-        if (m) this.hid.multiTouch(m.type as "begin" | "move" | "end", m.x1, m.y1, m.x2, m.y2, W, H);
+        if (m) {
+          this.recordHidEvent(tag, m);
+          this.hid.multiTouch(m.type as "begin" | "move" | "end", m.x1, m.y1, m.x2, m.y2, W, H);
+        }
         break;
       }
       case 0x06: {
         const m = json<{ type: string; usage: number }>();
-        if (m) this.hid.key(m.type as "down" | "up", m.usage);
+        if (m) {
+          this.recordHidEvent(tag, m);
+          this.hid.key(m.type as "down" | "up", m.usage);
+        }
         break;
       }
       case 0x07: {
@@ -300,6 +344,7 @@ export class DeviceSession {
         if (!m) break;
         const value = ORIENTATION_BY_NAME[m.orientation];
         if (value != null && await this.hid.orientation(value)) {
+          this.recordHidEvent(tag, m);
           if (m.orientation !== this.orientation) {
             this.orientation = m.orientation;
             this.broadcastConfig();
@@ -309,27 +354,157 @@ export class DeviceSession {
       }
       case 0x08: {
         const m = json<{ option: string; enabled: boolean }>();
-        if (m) this.hid.caDebug(m.option, m.enabled);
+        if (m) {
+          this.recordHidEvent(tag, m);
+          this.hid.caDebug(m.option, m.enabled);
+        }
         break;
       }
       case 0x09:
+        this.recordHidEvent(tag, {});
         this.hid.memoryWarning();
         break;
       case 0x0a: {
         const m = json<{ delta: number }>();
-        if (m) this.hid.digitalCrown(m.delta);
+        if (m) {
+          this.recordHidEvent(tag, m);
+          this.hid.digitalCrown(m.delta);
+        }
         break;
       }
       case 0x0b: {
         // Payload deltas are a fraction of the display; scale to device pixels.
         const m = json<{ dx: number; dy: number; x?: number; y?: number }>();
-        if (m) this.hid.scroll(m.dx * W, m.dy * H, W, H, m.x, m.y);
+        if (m) {
+          this.recordHidEvent(tag, m);
+          this.hid.scroll(m.dx * W, m.dy * H, W, H, m.x, m.y);
+        }
         break;
       }
       case 0x0c:
+        this.recordHidEvent(tag, {});
         this.hid.softwareKeyboard();
         break;
     }
+  }
+
+  private recordTouchEvent(payload: { type: string; x: number; y: number; edge?: number }): void {
+    if (payload.type === "begin") {
+      this.touchGestureLog = newTouchGesture(payload);
+      return;
+    }
+
+    if (payload.type === "move") {
+      let gesture = this.touchGestureLog;
+      if (!gesture) {
+        gesture = newTouchGesture(payload);
+        this.touchGestureLog = gesture;
+      }
+
+      gesture.lastX = payload.x;
+      gesture.lastY = payload.y;
+      gesture.moveCount++;
+      if (payload.edge != null) gesture.edge = payload.edge;
+      if (touchGestureMoved(gesture)) {
+        if (gesture.eventId == null) {
+          const entry = recordEventLogEvent({
+            device: this.udid,
+            source: "hid",
+            kind: "drag",
+            action: "drag",
+            summary: touchGestureSummary(gesture),
+            details: this.touchGestureDetails(gesture, "drag", "move"),
+          });
+          gesture.eventId = entry.id;
+        } else {
+          // Keep the stored drag current without streaming every touchmove to the browser.
+          updateEventLogEvent(
+            gesture.eventId,
+            {
+              kind: "drag",
+              action: "drag",
+              summary: touchGestureSummary(gesture),
+              details: this.touchGestureDetails(gesture, "drag", "move"),
+            },
+            { notify: false },
+          );
+        }
+      }
+      return;
+    }
+
+    if (payload.type === "end") {
+      const gesture = this.touchGestureLog;
+      if (gesture) {
+        gesture.lastX = payload.x;
+        gesture.lastY = payload.y;
+        if (payload.edge != null) gesture.edge = payload.edge;
+        if (gesture.moveCount > 0 && touchGestureMoved(gesture)) {
+          if (gesture.eventId == null) {
+            recordEventLogEvent({
+              device: this.udid,
+              source: "hid",
+              kind: "drag",
+              action: "drag",
+              summary: touchGestureSummary(gesture),
+              details: this.touchGestureDetails(gesture, "drag", "end"),
+            });
+          } else {
+            updateEventLogEvent(gesture.eventId, {
+              kind: "drag",
+              action: "drag",
+              summary: touchGestureSummary(gesture),
+              details: this.touchGestureDetails(gesture, "drag", "end"),
+            });
+          }
+        } else {
+          recordEventLogEvent({
+            device: this.udid,
+            source: "hid",
+            kind: "tap",
+            action: "tap",
+            summary: `Tap ${formatEventLogPoint(payload.x, payload.y)}`,
+            details: this.touchGestureDetails(gesture, "tap"),
+          });
+        }
+        this.touchGestureLog = undefined;
+        return;
+      }
+    }
+
+    this.recordHidEvent(0x03, payload);
+  }
+
+  private eventLogScreen(): { width: number; height: number } | undefined {
+    return this.width > 0 && this.height > 0
+      ? { width: this.width, height: this.height }
+      : undefined;
+  }
+
+  private touchGestureDetails(
+    gesture: TouchGestureLog,
+    type: "drag" | "tap",
+    phase?: "move" | "end",
+  ): Record<string, unknown> {
+    return {
+      type,
+      ...(phase ? { phase } : {}),
+      start: { x: gesture.startX, y: gesture.startY },
+      current: { x: gesture.lastX, y: gesture.lastY },
+      moveCount: gesture.moveCount,
+      ...(gesture.edge != null ? { edge: gesture.edge } : {}),
+      ...(this.eventLogScreen() ? { screen: this.eventLogScreen() } : {}),
+    };
+  }
+
+  private recordHidEvent(tag: number, payload: Record<string, unknown>): void {
+    const event = eventLogEventForHidMessage(
+      this.udid,
+      tag,
+      payload,
+      this.eventLogScreen(),
+    );
+    if (event) recordEventLogEvent(event);
   }
 
   // ── Config ───────────────────────────────────────────────────────────────
